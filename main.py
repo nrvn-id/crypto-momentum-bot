@@ -62,7 +62,7 @@ def format_message(tokens):
         if news:
             lines.append(f"   📰 _{news[0]}_")
 
-    lines.append("\n_Data: CoinGecko + CryptoPanic. Bukan sinyal beli, lakukan riset lanjutan._")
+    lines.append("\n_Data: CoinGecko + RSS Google. Bukan sinyal beli, lakukan riset lanjutan._")
     return "\n".join(lines)
 
 def send_telegram(message):

@@ -1,10 +1,23 @@
-import os
-import requests
+import feedparser
+from urllib.parse import quote
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
+
+
+def fetch_news(symbol, limit=1):
+    query = quote(f"{symbol} crypto")
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+    try:
+        feed = feedparser.parse(url)
+        titles = [entry.title for entry in feed.entries[:limit]]
+        return titles
+    except Exception:
+        return []
+
+
 
 def fetch_top_movers(top_n=10):
     params = {
@@ -42,7 +55,12 @@ def format_message(tokens):
         change = t["price_change_percentage_24h"]
         volume_m = t["total_volume"] / 1_000_000
         lines.append(f"{i}. *{symbol}* — {change:+.2f}% | Vol: ${volume_m:,.1f}M")
-    lines.append("\n_Data: CoinGecko 24h. Bukan sinyal beli, lakukan riset lanjutan._")
+
+        news = fetch_news(symbol)
+        if news:
+            lines.append(f"   📰 _{news[0]}_")
+
+    lines.append("\n_Data: CoinGecko + CryptoPanic. Bukan sinyal beli, lakukan riset lanjutan._")
     return "\n".join(lines)
 
 def send_telegram(message):

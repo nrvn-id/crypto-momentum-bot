@@ -4,31 +4,33 @@ import requests
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-BINANCE_URL = "https://api.binance.com/api/v3/ticker/24hr"
+COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
 
 def fetch_top_movers(top_n=10):
-    resp = requests.get(BINANCE_URL, timeout=15)
+    params = {
+        "vs_currency": "usd",
+        "order": "volume_desc",
+        "per_page": 100,
+        "page": 1,
+        "price_change_percentage": "24h",
+    }
+    resp = requests.get(COINGECKO_URL, params=params, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
-    # Filter hanya pair USDT, buang stablecoin & leveraged token
-    excluded = ("UP", "DOWN", "BULL", "BEAR")
     filtered = [
         d for d in data
-        if d["symbol"].endswith("USDT")
-           and not d["symbol"].startswith(("USDC", "USDT", "FDUSD", "TUSD"))
-           and not any(x in d["symbol"] for x in excluded)
+        if d.get("price_change_percentage_24h") is not None
+           and d.get("total_volume") is not None
+           and d["price_change_percentage_24h"] > 0
     ]
 
-    for d in filtered:
-        d["priceChangePercent"] = float(d["priceChangePercent"])
-        d["quoteVolume"] = float(d["quoteVolume"])
-
-    # Ranking sederhana: kombinasi volume tinggi + kenaikan harga positif
-    movers = [d for d in filtered if d["priceChangePercent"] > 0]
     ranked = sorted(
-        movers,
-        key=lambda d: (d["priceChangePercent"] * 0.5 + (d["quoteVolume"] / 1_000_000) * 0.5),
+        filtered,
+        key=lambda d: (
+                d["price_change_percentage_24h"] * 0.5
+                + (d["total_volume"] / 1_000_000) * 0.5
+        ),
         reverse=True
     )
     return ranked[:top_n]
@@ -36,11 +38,11 @@ def fetch_top_movers(top_n=10):
 def format_message(tokens):
     lines = ["🚀 *Top 10 Momentum Crypto Hari Ini*\n"]
     for i, t in enumerate(tokens, 1):
-        symbol = t["symbol"].replace("USDT", "")
-        change = t["priceChangePercent"]
-        volume_m = t["quoteVolume"] / 1_000_000
+        symbol = t["symbol"].upper()
+        change = t["price_change_percentage_24h"]
+        volume_m = t["total_volume"] / 1_000_000
         lines.append(f"{i}. *{symbol}* — {change:+.2f}% | Vol: ${volume_m:,.1f}M")
-    lines.append("\n_Data: Binance 24h. Bukan sinyal beli, lakukan riset lanjutan._")
+    lines.append("\n_Data: CoinGecko 24h. Bukan sinyal beli, lakukan riset lanjutan._")
     return "\n".join(lines)
 
 def send_telegram(message):

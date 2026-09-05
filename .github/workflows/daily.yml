@@ -1,9 +1,9 @@
-name: Daily Crypto Momentum Bot
+name: OKX Trend Scanner Bot
 
 on:
   schedule:
-    - cron: "0 1 * * *"  # jam 08:00 WIB (UTC+7)
-  workflow_dispatch: {}   # biar bisa trigger manual juga
+    - cron: "0 * * * *"   # tiap jam, di menit ke-0 (UTC)
+  workflow_dispatch: {}    # bisa trigger manual dari tab Actions
 
 jobs:
   run-bot:

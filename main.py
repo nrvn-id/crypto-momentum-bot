@@ -1,19 +1,31 @@
 """
-OKX Trend Scanner Bot (GitHub Actions edition) — v2
+OKX Trend Scanner Bot (GitHub Actions edition) — v3
 ------------------------------------------------------
-Perubahan dari versi sebelumnya:
-- Timeframe candle: 1H (bukan 15m)
-- Scan SEMUA pair futures perpetual USDT-margined yang aktif di OKX
-  (bukan cuma 4 pair tetap)
-- Hanya kirim pair yang STRONG BUY: direction == LONG dan score >= STRONG_SCORE_THRESHOLD
+Ganti total metode filter dari versi sebelumnya (EMA/Supertrend/ADX/Ichimoku
+score) menjadi mengikuti cara riset manual kamu:
 
-ENV VARS (GitHub Secrets, nama sama seperti sebelumnya):
+1. TIMEFRAME ENTRY (1H): cari StochRSI %K cross up %D dari area oversold
+   -> ini "pemicu" sinyal, nandain momentum baru mulai belok naik.
+2. KONFIRMASI 4H: RSI & StochRSI belum overbought/overextended (masih ada
+   ruang naik), bias netral-ke-bullish.
+3. KONFIRMASI 1D: sama seperti 4H tapi di timeframe harian -> memastikan
+   trend besar juga tidak sedang jenuh beli.
+   Pair cuma lolos jadi kandidat kalau LOLOS KETIGANYA. Ini sengaja ketat
+   supaya yang lolos cuma sedikit pair yang benar teknikal, bukan yang
+   sudah "terbang tinggi".
+4. Untuk pair yang lolos, dihitung level Fibonacci retracement/extension
+   dari swing 4H sebagai REFERENSI Entry/TP/SL (bukan rekomendasi final —
+   tetap riset manual sebelum entry).
+
+Optimisasi request: candle 4H & 1D cuma diambil untuk pair yang SUDAH lolos
+cross di 1H, jadi tidak perlu fetch 3x untuk semua ratusan pair.
+
+ENV VARS (GitHub Secrets):
 - TELEGRAM_TOKEN
 - TELEGRAM_CHAT_ID
 """
 
 import os
-import math
 import time
 
 import requests
@@ -24,12 +36,29 @@ import pandas as pd
 
 OKX_BASE_URL = "https://www.okx.com"
 
-BAR = "1H"                     # timeframe candle
-CANDLE_LIMIT = 200
-SETTLE_CCY = "USDT"            # cuma pair futures yang settle-nya USDT
-STRONG_SCORE_THRESHOLD = 75    # dianggap "strong buy" kalau skor >= ini
-MAX_RESULTS_IN_MESSAGE = 25    # batasi jumlah baris per pesan biar tidak kepanjangan
-REQUEST_DELAY_SEC = 0.15       # jeda antar request supaya tidak kena rate limit OKX
+ENTRY_BAR = "1H"     # timeframe pemicu sinyal (StochRSI cross)
+CONFIRM_BAR_1 = "4H"
+CONFIRM_BAR_2 = "1D"
+
+CANDLE_LIMIT_ENTRY = 200
+CANDLE_LIMIT_CONFIRM = 150
+
+SETTLE_CCY = "USDT"
+REQUEST_DELAY_SEC = 0.15
+
+RSI_LENGTH = 14
+STOCH_LENGTH = 14
+STOCH_K_SMOOTH = 3
+STOCH_D_SMOOTH = 3
+OVERSOLD = 20
+OVERBOUGHT = 80
+CROSS_LOOKBACK = 5          # cek "baru saja oversold" dalam N candle terakhir
+CONFIRM_RSI_MAX = 70        # di atas ini dianggap sudah terlalu jenuh beli
+CONFIRM_RSI_MIN = 45        # di bawah ini dianggap belum ada bias bullish
+
+FIB_LOOKBACK = 60           # jumlah candle 4H untuk cari swing high/low
+
+MAX_RESULTS_IN_MESSAGE = 15
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -37,14 +66,12 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 # ============================== DATA FETCH ==============================
 
 def fetch_active_swap_instruments(settle_ccy: str = SETTLE_CCY) -> list:
-    """Ambil semua instId futures perpetual (SWAP) yang aktif & settle di USDT."""
     url = f"{OKX_BASE_URL}/api/v5/public/instruments"
     resp = requests.get(url, params={"instType": "SWAP"}, timeout=15)
     resp.raise_for_status()
     data = resp.json()
     if data.get("code") != "0":
         raise RuntimeError(f"Gagal ambil daftar instrument OKX: {data}")
-
     instruments = data["data"]
     filtered = [
         i["instId"] for i in instruments
@@ -53,7 +80,7 @@ def fetch_active_swap_instruments(settle_ccy: str = SETTLE_CCY) -> list:
     return sorted(filtered)
 
 
-def fetch_candles(inst_id: str, bar: str = BAR, limit: int = CANDLE_LIMIT, retries: int = 3) -> pd.DataFrame:
+def fetch_candles(inst_id: str, bar: str, limit: int, retries: int = 3) -> pd.DataFrame:
     url = f"{OKX_BASE_URL}/api/v5/market/candles"
     params = {"instId": inst_id, "bar": bar, "limit": str(limit)}
 
@@ -66,14 +93,14 @@ def fetch_candles(inst_id: str, bar: str = BAR, limit: int = CANDLE_LIMIT, retri
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") != "0":
-            raise RuntimeError(f"OKX error untuk {inst_id}: {data}")
+            raise RuntimeError(f"OKX error untuk {inst_id} ({bar}): {data}")
         break
     if data is None:
-        raise RuntimeError(f"Rate limited terus untuk {inst_id}, dilewati")
+        raise RuntimeError(f"Rate limited terus untuk {inst_id} ({bar})")
 
     rows = data["data"]
     if not rows:
-        raise RuntimeError(f"Tidak ada data candle untuk {inst_id}")
+        raise RuntimeError(f"Tidak ada data candle untuk {inst_id} ({bar})")
 
     cols = ["ts", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"]
     df = pd.DataFrame(rows, columns=cols[: len(rows[0])])
@@ -86,11 +113,7 @@ def fetch_candles(inst_id: str, bar: str = BAR, limit: int = CANDLE_LIMIT, retri
 
 # ============================== INDIKATOR ==============================
 
-def ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
-
-
-def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+def rsi(series: pd.Series, length: int = RSI_LENGTH) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -100,184 +123,160 @@ def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     return (100 - (100 / (1 + rs))).fillna(50)
 
 
-def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / length, adjust=False).mean()
+def stoch_rsi(close: pd.Series, rsi_length=RSI_LENGTH, stoch_length=STOCH_LENGTH,
+              k_smooth=STOCH_K_SMOOTH, d_smooth=STOCH_D_SMOOTH):
+    """Return (rsi_series, k, d). K/D dalam skala 0-100."""
+    rsi_series = rsi(close, rsi_length)
+    min_rsi = rsi_series.rolling(stoch_length).min()
+    max_rsi = rsi_series.rolling(stoch_length).max()
+    raw = (rsi_series - min_rsi) / (max_rsi - min_rsi).replace(0, np.nan) * 100
+    k = raw.rolling(k_smooth).mean()
+    d = k.rolling(d_smooth).mean()
+    return rsi_series, k.fillna(50), d.fillna(50)
 
 
-def adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    high, low = df["high"], df["low"]
-    up_move = high.diff()
-    down_move = -low.diff()
-
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    tr_atr = atr(df, length)
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / length, adjust=False).mean() / tr_atr
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / length, adjust=False).mean() / tr_atr
-
-    dx = (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) * 100
-    return dx.ewm(alpha=1 / length, adjust=False).mean().fillna(0)
-
-
-def supertrend(df: pd.DataFrame, length: int = 10, mult: float = 3.0):
-    hl2 = (df["high"] + df["low"]) / 2
-    tr_atr = atr(df, length)
-    upper_basic = hl2 + mult * tr_atr
-    lower_basic = hl2 - mult * tr_atr
-
-    final_upper = upper_basic.copy()
-    final_lower = lower_basic.copy()
-    direction = pd.Series(1, index=df.index)
-
-    for i in range(1, len(df)):
-        final_upper.iloc[i] = (
-            upper_basic.iloc[i]
-            if (upper_basic.iloc[i] < final_upper.iloc[i - 1] or df["close"].iloc[i - 1] > final_upper.iloc[i - 1])
-            else final_upper.iloc[i - 1]
-        )
-        final_lower.iloc[i] = (
-            lower_basic.iloc[i]
-            if (lower_basic.iloc[i] > final_lower.iloc[i - 1] or df["close"].iloc[i - 1] < final_lower.iloc[i - 1])
-            else final_lower.iloc[i - 1]
-        )
-
-    for i in range(1, len(df)):
-        if df["close"].iloc[i] > final_upper.iloc[i - 1]:
-            direction.iloc[i] = 1
-        elif df["close"].iloc[i] < final_lower.iloc[i - 1]:
-            direction.iloc[i] = -1
-        else:
-            direction.iloc[i] = direction.iloc[i - 1]
-            if direction.iloc[i] == 1 and final_lower.iloc[i] < final_lower.iloc[i - 1]:
-                final_lower.iloc[i] = final_lower.iloc[i - 1]
-            if direction.iloc[i] == -1 and final_upper.iloc[i] > final_upper.iloc[i - 1]:
-                final_upper.iloc[i] = final_upper.iloc[i - 1]
-
-    return direction
+def fibonacci_levels(df: pd.DataFrame, lookback: int = FIB_LOOKBACK) -> dict:
+    recent = df.tail(lookback)
+    swing_low = float(recent["low"].min())
+    swing_high = float(recent["high"].max())
+    diff = swing_high - swing_low
+    return {
+        "swing_low": swing_low,
+        "swing_high": swing_high,
+        "0.236": swing_high - 0.236 * diff,
+        "0.382": swing_high - 0.382 * diff,
+        "0.5": swing_high - 0.5 * diff,
+        "0.618": swing_high - 0.618 * diff,
+        "0.786": swing_high - 0.786 * diff,
+        "ext_1.272": swing_high + 0.272 * diff,
+        "ext_1.618": swing_high + 0.618 * diff,
+    }
 
 
-def ichimoku(df: pd.DataFrame):
-    high, low, close = df["high"], df["low"], df["close"]
-    tenkan = (high.rolling(9).max() + low.rolling(9).min()) / 2
-    kijun = (high.rolling(26).max() + low.rolling(26).min()) / 2
-    senkou_a = (tenkan + kijun) / 2
-    senkou_b = (high.rolling(52).max() + low.rolling(52).min()) / 2
+# ============================== SIGNAL LOGIC ==============================
 
-    cloud_top = pd.concat([senkou_a, senkou_b], axis=1).max(axis=1)
-    cloud_bottom = pd.concat([senkou_a, senkou_b], axis=1).min(axis=1)
+def entry_cross_signal(df: pd.DataFrame) -> dict:
+    """StochRSI %K cross up %D di candle terakhir, dan sempat oversold
+    dalam beberapa candle sebelumnya (bukan cross di tengah range)."""
+    _, k, d = stoch_rsi(df["close"])
+    if len(k) < CROSS_LOOKBACK + 2:
+        return {"ok": False}
 
-    return {"bull": close > cloud_top, "bear": close < cloud_bottom}
-
-
-# ============================== SCORING ==============================
-
-def score_label(score: int) -> str:
-    if score >= 80:
-        return "VERY STRONG"
-    if score >= 60:
-        return "STRONG"
-    if score >= 40:
-        return "MODERATE"
-    return "WEAK"
+    crossed_up = k.iloc[-2] <= d.iloc[-2] and k.iloc[-1] > d.iloc[-1]
+    recently_oversold = (
+            k.iloc[-(CROSS_LOOKBACK + 1):-1].min() <= OVERSOLD
+            or d.iloc[-(CROSS_LOOKBACK + 1):-1].min() <= OVERSOLD
+    )
+    return {
+        "ok": bool(crossed_up and recently_oversold),
+        "k": round(float(k.iloc[-1]), 1),
+        "d": round(float(d.iloc[-1]), 1),
+    }
 
 
-def analyze(df: pd.DataFrame, inst_id: str) -> dict:
-    close = df["close"]
+def confirm_not_overextended(df: pd.DataFrame) -> dict:
+    """Cek RSI & StochRSI di timeframe lebih besar: belum jenuh beli,
+    tapi juga bukan bias bearish."""
+    rsi_series, k, d = stoch_rsi(df["close"])
+    rsi_now = float(rsi_series.iloc[-1])
+    k_now = float(k.iloc[-1])
+    ok = (CONFIRM_RSI_MIN <= rsi_now <= CONFIRM_RSI_MAX) and (k_now <= OVERBOUGHT)
+    return {"ok": ok, "rsi": round(rsi_now, 1), "k": round(k_now, 1), "d": round(float(d.iloc[-1]), 1)}
 
-    ema20, ema50, ema100, ema200 = ema(close, 20), ema(close, 50), ema(close, 100), ema(close, 200)
-    ema_bull = ema20.iloc[-1] > ema50.iloc[-1] > ema100.iloc[-1] > ema200.iloc[-1]
 
-    st_dir = supertrend(df)
-    st_bull = st_dir.iloc[-1] == 1
+# ============================== SCAN ==============================
 
-    adx_series = adx(df)
-    adx_now = adx_series.iloc[-1]
-    adx_rising = adx_now > adx_series.iloc[-3] if len(adx_series) > 3 else False
+def scan_instrument(inst_id: str):
+    """Return dict kandidat kalau lolos 1H trigger + 4H & 1D confirm, else None."""
+    df_1h = fetch_candles(inst_id, ENTRY_BAR, CANDLE_LIMIT_ENTRY)
+    if len(df_1h) < 60:
+        return None
+    entry = entry_cross_signal(df_1h)
+    if not entry["ok"]:
+        return None
 
-    ich = ichimoku(df)
-    ich_bull = bool(ich["bull"].iloc[-1])
+    time.sleep(REQUEST_DELAY_SEC)
+    df_4h = fetch_candles(inst_id, CONFIRM_BAR_1, CANDLE_LIMIT_CONFIRM)
+    if len(df_4h) < 60:
+        return None
+    confirm_4h = confirm_not_overextended(df_4h)
+    if not confirm_4h["ok"]:
+        return None
 
-    rsi_now = rsi(close).iloc[-1]
-    rsi_bull = rsi_now > 55
+    time.sleep(REQUEST_DELAY_SEC)
+    df_1d = fetch_candles(inst_id, CONFIRM_BAR_2, CANDLE_LIMIT_CONFIRM)
+    if len(df_1d) < 60:
+        return None
+    confirm_1d = confirm_not_overextended(df_1d)
+    if not confirm_1d["ok"]:
+        return None
 
-    vol_avg = df["vol"].rolling(20).mean().iloc[-1]
-    vol_now = df["vol"].iloc[-1]
-    vol_ratio = (vol_now / vol_avg) if vol_avg and not math.isnan(vol_avg) else 1.0
-    vol_high = vol_ratio >= 1.5
-
-    ema_bear = ema20.iloc[-1] < ema50.iloc[-1] < ema100.iloc[-1] < ema200.iloc[-1]
-    ich_bear = bool(ich["bear"].iloc[-1])
-    rsi_bear = rsi_now < 45
-
-    checks_long = [ema_bull, st_bull, adx_rising, ich_bull, rsi_bull, vol_high]
-    checks_short = [ema_bear, not st_bull, adx_rising, ich_bear, rsi_bear, vol_high]
-
-    long_score = int(sum(checks_long) / len(checks_long) * 100)
-    short_score = int(sum(checks_short) / len(checks_short) * 100)
-
-    if long_score >= short_score and long_score > 0:
-        direction, score = "LONG", long_score
-    elif short_score > long_score:
-        direction, score = "SHORT", short_score
-    else:
-        direction, score = "NEUTRAL", 0
+    price = float(df_1h["close"].iloc[-1])
+    fib = fibonacci_levels(df_4h)
 
     return {
         "inst_id": inst_id,
-        "price": float(close.iloc[-1]),
-        "direction": direction,
-        "score": score,
-        "label": score_label(score),
-        "vol_ratio": round(float(vol_ratio), 2),
-        "adx": round(float(adx_now), 1),
+        "price": price,
+        "entry_1h": entry,
+        "confirm_4h": confirm_4h,
+        "confirm_1d": confirm_1d,
+        "fib": fib,
     }
 
 
 # ============================== TELEGRAM ==============================
 
-def format_strong_buy_message(strong_buys: list, total_scanned: int) -> list:
-    """Return list of message chunks (Telegram limit ~4096 char per pesan)."""
-    header = (
-        f"📊 *OKX Strong Buy Scan* ({BAR})\n"
-        f"Discan: {total_scanned} pair futures | Kriteria: LONG & skor >= {STRONG_SCORE_THRESHOLD}\n"
+def format_candidate_block(c: dict) -> str:
+    fib = c["fib"]
+    sl_ref = fib["0.786"] if c["price"] > fib["0.786"] else fib["swing_low"]
+    tp1 = fib["swing_high"]
+    tp2 = fib["ext_1.272"]
+    tp3 = fib["ext_1.618"]
+
+    return (
+        f"🟢 *{c['inst_id']}*\n"
+        f"Harga sekarang: {c['price']:,.4f}\n"
+        f"1H StochRSI cross up dari oversold: K {c['entry_1h']['k']} / D {c['entry_1h']['d']} ✅\n"
+        f"4H konfirmasi: RSI {c['confirm_4h']['rsi']} | StochRSI K {c['confirm_4h']['k']}/D {c['confirm_4h']['d']}\n"
+        f"1D konfirmasi: RSI {c['confirm_1d']['rsi']} | StochRSI K {c['confirm_1d']['k']}/D {c['confirm_1d']['d']}\n"
+        f"Referensi Fibonacci (swing 4H):\n"
+        f"  Entry ref: {c['price']:,.4f}\n"
+        f"  SL ref: {sl_ref:,.4f}\n"
+        f"  TP1: {tp1:,.4f} | TP2: {tp2:,.4f} | TP3: {tp3:,.4f}"
     )
 
-    if not strong_buys:
-        return [header + "\nTidak ada pair yang memenuhi kriteria strong buy saat ini."]
 
-    shown = strong_buys[:MAX_RESULTS_IN_MESSAGE]
-    lines = [header, ""]
-    for r in shown:
-        lines.append(
-            f"🟢 *{r['inst_id']}* — {r['score']} ({r['label']})\n"
-            f"    Harga: {r['price']:,.4f} | ADX {r['adx']} | Vol {r['vol_ratio']}x"
-        )
+def format_message(candidates: list, total_scanned: int) -> list:
+    header = (
+        f"📊 *OKX Entry Scan* — StochRSI cross (1H) + konfirmasi 4H & 1D\n"
+        f"Discan: {total_scanned} pair futures\n"
+    )
 
-    if len(strong_buys) > MAX_RESULTS_IN_MESSAGE:
-        lines.append(f"\n...dan {len(strong_buys) - MAX_RESULTS_IN_MESSAGE} pair lain juga strong buy.")
+    if not candidates:
+        return [header + "\nTidak ada pair yang lolos ketiga filter saat ini. Cek lagi jam berikutnya."]
 
-    lines.append("\n_Data: OKX public API. Bukan sinyal beli, lakukan riset lanjutan._")
+    shown = candidates[:MAX_RESULTS_IN_MESSAGE]
+    blocks = [header]
+    for c in shown:
+        blocks.append(format_candidate_block(c))
 
-    text = "\n".join(lines)
+    if len(candidates) > MAX_RESULTS_IN_MESSAGE:
+        blocks.append(f"...dan {len(candidates) - MAX_RESULTS_IN_MESSAGE} pair lain juga lolos.")
 
+    blocks.append("_Level Fibonacci & TP/SL cuma referensi teknikal, tetap riset manual sebelum entry._")
+
+    text = "\n\n".join(blocks)
     max_len = 3800
     if len(text) <= max_len:
         return [text]
 
+    # pecah per blok kalau kepanjangan
     chunks, current = [], header + "\n"
-    for line in lines[2:]:
-        if len(current) + len(line) + 1 > max_len:
+    for block in blocks[1:]:
+        if len(current) + len(block) + 2 > max_len:
             chunks.append(current)
             current = ""
-        current += line + "\n"
+        current += block + "\n\n"
     if current.strip():
         chunks.append(current)
     return chunks
@@ -296,25 +295,22 @@ def main():
     symbols = fetch_active_swap_instruments()
     print(f"Total pair futures USDT aktif di OKX: {len(symbols)}")
 
-    results = []
+    candidates = []
+    scanned = 0
     for inst_id in symbols:
         try:
-            df = fetch_candles(inst_id)
-            if len(df) < 60:
-                print(f"[SKIP] {inst_id}: candle terlalu sedikit ({len(df)})")
-                continue
-            results.append(analyze(df, inst_id))
+            result = scan_instrument(inst_id)
+            scanned += 1
+            if result:
+                candidates.append(result)
+                print(f"[CANDIDATE] {inst_id}")
         except Exception as e:
             print(f"[ERROR] {inst_id}: {e}")
         time.sleep(REQUEST_DELAY_SEC)
 
-    print(f"Berhasil dianalisis: {len(results)} / {len(symbols)}")
+    print(f"Berhasil discan: {scanned} / {len(symbols)} | Kandidat lolos: {len(candidates)}")
 
-    strong_buys = [r for r in results if r["direction"] == "LONG" and r["score"] >= STRONG_SCORE_THRESHOLD]
-    strong_buys.sort(key=lambda r: r["score"], reverse=True)
-    print(f"Strong buy ditemukan: {len(strong_buys)}")
-
-    chunks = format_strong_buy_message(strong_buys, total_scanned=len(results))
+    chunks = format_message(candidates, total_scanned=scanned)
     for chunk in chunks:
         send_telegram(chunk)
 

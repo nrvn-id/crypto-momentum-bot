@@ -1,20 +1,20 @@
 """
-OKX Trend Scanner Bot (GitHub Actions edition)
-------------------------------------------------
-Pengganti bot momentum lama. Tiap kali dijalankan (via GitHub Actions,
-cron tiap 1 jam), script ini:
-1. Ambil candle 15m dari OKX (public API, tanpa API key) untuk pair yang dipantau
-2. Hitung skor trend 0-100 (EMA alignment, Supertrend, ADX, Ichimoku, RSI, volume)
-3. Kirim SATU pesan ringkasan ke Telegram berisi semua pair, diurutkan dari
-   skor tertinggi, dengan tanda khusus untuk yang sinyalnya kuat.
+OKX Trend Scanner Bot (GitHub Actions edition) — v2
+------------------------------------------------------
+Perubahan dari versi sebelumnya:
+- Timeframe candle: 1H (bukan 15m)
+- Scan SEMUA pair futures perpetual USDT-margined yang aktif di OKX
+  (bukan cuma 4 pair tetap)
+- Hanya kirim pair yang STRONG BUY: direction == LONG dan score >= STRONG_SCORE_THRESHOLD
 
-ENV VARS (diisi lewat GitHub Secrets, nama sama seperti bot lama):
+ENV VARS (GitHub Secrets, nama sama seperti sebelumnya):
 - TELEGRAM_TOKEN
 - TELEGRAM_CHAT_ID
 """
 
 import os
 import math
+import time
 
 import requests
 import numpy as np
@@ -24,32 +24,57 @@ import pandas as pd
 
 OKX_BASE_URL = "https://www.okx.com"
 
-SYMBOLS = [
-    "HYPE-USDT-SWAP",
-    "KAITO-USDT-SWAP",
-    "AVAX-USDT-SWAP",
-    "BTC-USDT-SWAP",
-]
-
-BAR = "15m"                # timeframe candle yang dibaca tiap run
+BAR = "1H"                     # timeframe candle
 CANDLE_LIMIT = 200
-STRONG_SCORE_THRESHOLD = 75  # dapat tanda 🔥 kalau skor >= ini
+SETTLE_CCY = "USDT"            # cuma pair futures yang settle-nya USDT
+STRONG_SCORE_THRESHOLD = 75    # dianggap "strong buy" kalau skor >= ini
+MAX_RESULTS_IN_MESSAGE = 25    # batasi jumlah baris per pesan biar tidak kepanjangan
+REQUEST_DELAY_SEC = 0.15       # jeda antar request supaya tidak kena rate limit OKX
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # ============================== DATA FETCH ==============================
 
-def fetch_candles(inst_id: str, bar: str = BAR, limit: int = CANDLE_LIMIT) -> pd.DataFrame:
-    url = f"{OKX_BASE_URL}/api/v5/market/candles"
-    params = {"instId": inst_id, "bar": bar, "limit": str(limit)}
-    resp = requests.get(url, params=params, timeout=15)
+def fetch_active_swap_instruments(settle_ccy: str = SETTLE_CCY) -> list:
+    """Ambil semua instId futures perpetual (SWAP) yang aktif & settle di USDT."""
+    url = f"{OKX_BASE_URL}/api/v5/public/instruments"
+    resp = requests.get(url, params={"instType": "SWAP"}, timeout=15)
     resp.raise_for_status()
     data = resp.json()
     if data.get("code") != "0":
-        raise RuntimeError(f"OKX error untuk {inst_id}: {data}")
+        raise RuntimeError(f"Gagal ambil daftar instrument OKX: {data}")
+
+    instruments = data["data"]
+    filtered = [
+        i["instId"] for i in instruments
+        if i.get("settleCcy") == settle_ccy and i.get("state") == "live"
+    ]
+    return sorted(filtered)
+
+
+def fetch_candles(inst_id: str, bar: str = BAR, limit: int = CANDLE_LIMIT, retries: int = 3) -> pd.DataFrame:
+    url = f"{OKX_BASE_URL}/api/v5/market/candles"
+    params = {"instId": inst_id, "bar": bar, "limit": str(limit)}
+
+    data = None
+    for attempt in range(retries):
+        resp = requests.get(url, params=params, timeout=15)
+        if resp.status_code == 429:
+            time.sleep(1 + attempt)
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != "0":
+            raise RuntimeError(f"OKX error untuk {inst_id}: {data}")
+        break
+    if data is None:
+        raise RuntimeError(f"Rate limited terus untuk {inst_id}, dilewati")
 
     rows = data["data"]
+    if not rows:
+        raise RuntimeError(f"Tidak ada data candle untuk {inst_id}")
+
     cols = ["ts", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"]
     df = pd.DataFrame(rows, columns=cols[: len(rows[0])])
     df = df.iloc[::-1].reset_index(drop=True)
@@ -169,7 +194,6 @@ def analyze(df: pd.DataFrame, inst_id: str) -> dict:
 
     ema20, ema50, ema100, ema200 = ema(close, 20), ema(close, 50), ema(close, 100), ema(close, 200)
     ema_bull = ema20.iloc[-1] > ema50.iloc[-1] > ema100.iloc[-1] > ema200.iloc[-1]
-    ema_bear = ema20.iloc[-1] < ema50.iloc[-1] < ema100.iloc[-1] < ema200.iloc[-1]
 
     st_dir = supertrend(df)
     st_bull = st_dir.iloc[-1] == 1
@@ -180,16 +204,18 @@ def analyze(df: pd.DataFrame, inst_id: str) -> dict:
 
     ich = ichimoku(df)
     ich_bull = bool(ich["bull"].iloc[-1])
-    ich_bear = bool(ich["bear"].iloc[-1])
 
     rsi_now = rsi(close).iloc[-1]
     rsi_bull = rsi_now > 55
-    rsi_bear = rsi_now < 45
 
     vol_avg = df["vol"].rolling(20).mean().iloc[-1]
     vol_now = df["vol"].iloc[-1]
     vol_ratio = (vol_now / vol_avg) if vol_avg and not math.isnan(vol_avg) else 1.0
     vol_high = vol_ratio >= 1.5
+
+    ema_bear = ema20.iloc[-1] < ema50.iloc[-1] < ema100.iloc[-1] < ema200.iloc[-1]
+    ich_bear = bool(ich["bear"].iloc[-1])
+    rsi_bear = rsi_now < 45
 
     checks_long = [ema_bull, st_bull, adx_rising, ich_bull, rsi_bull, vol_high]
     checks_short = [ema_bear, not st_bull, adx_rising, ich_bear, rsi_bear, vol_high]
@@ -217,18 +243,44 @@ def analyze(df: pd.DataFrame, inst_id: str) -> dict:
 
 # ============================== TELEGRAM ==============================
 
-def format_summary_message(results: list) -> str:
-    ranked = sorted(results, key=lambda r: r["score"], reverse=True)
-    lines = [f"📊 *OKX Trend Scan* ({BAR})\n"]
-    for r in ranked:
-        flag = "🔥 " if r["score"] >= STRONG_SCORE_THRESHOLD and r["direction"] != "NEUTRAL" else ""
-        arrow = "🟢" if r["direction"] == "LONG" else ("🔴" if r["direction"] == "SHORT" else "⚪")
+def format_strong_buy_message(strong_buys: list, total_scanned: int) -> list:
+    """Return list of message chunks (Telegram limit ~4096 char per pesan)."""
+    header = (
+        f"📊 *OKX Strong Buy Scan* ({BAR})\n"
+        f"Discan: {total_scanned} pair futures | Kriteria: LONG & skor >= {STRONG_SCORE_THRESHOLD}\n"
+    )
+
+    if not strong_buys:
+        return [header + "\nTidak ada pair yang memenuhi kriteria strong buy saat ini."]
+
+    shown = strong_buys[:MAX_RESULTS_IN_MESSAGE]
+    lines = [header, ""]
+    for r in shown:
         lines.append(
-            f"{flag}{arrow} *{r['inst_id']}* — {r['score']} ({r['label']}) | {r['direction']}\n"
+            f"🟢 *{r['inst_id']}* — {r['score']} ({r['label']})\n"
             f"    Harga: {r['price']:,.4f} | ADX {r['adx']} | Vol {r['vol_ratio']}x"
         )
+
+    if len(strong_buys) > MAX_RESULTS_IN_MESSAGE:
+        lines.append(f"\n...dan {len(strong_buys) - MAX_RESULTS_IN_MESSAGE} pair lain juga strong buy.")
+
     lines.append("\n_Data: OKX public API. Bukan sinyal beli, lakukan riset lanjutan._")
-    return "\n".join(lines)
+
+    text = "\n".join(lines)
+
+    max_len = 3800
+    if len(text) <= max_len:
+        return [text]
+
+    chunks, current = [], header + "\n"
+    for line in lines[2:]:
+        if len(current) + len(line) + 1 > max_len:
+            chunks.append(current)
+            current = ""
+        current += line + "\n"
+    if current.strip():
+        chunks.append(current)
+    return chunks
 
 
 def send_telegram(message: str):
@@ -241,8 +293,11 @@ def send_telegram(message: str):
 # ============================== MAIN ==============================
 
 def main():
+    symbols = fetch_active_swap_instruments()
+    print(f"Total pair futures USDT aktif di OKX: {len(symbols)}")
+
     results = []
-    for inst_id in SYMBOLS:
+    for inst_id in symbols:
         try:
             df = fetch_candles(inst_id)
             if len(df) < 60:
@@ -251,15 +306,19 @@ def main():
             results.append(analyze(df, inst_id))
         except Exception as e:
             print(f"[ERROR] {inst_id}: {e}")
+        time.sleep(REQUEST_DELAY_SEC)
 
-    if not results:
-        print("Tidak ada data yang berhasil dianalisis, tidak mengirim pesan.")
-        return
+    print(f"Berhasil dianalisis: {len(results)} / {len(symbols)}")
 
-    message = format_summary_message(results)
-    send_telegram(message)
+    strong_buys = [r for r in results if r["direction"] == "LONG" and r["score"] >= STRONG_SCORE_THRESHOLD]
+    strong_buys.sort(key=lambda r: r["score"], reverse=True)
+    print(f"Strong buy ditemukan: {len(strong_buys)}")
+
+    chunks = format_strong_buy_message(strong_buys, total_scanned=len(results))
+    for chunk in chunks:
+        send_telegram(chunk)
+
     print("Terkirim.")
-    print(message)
 
 
 if __name__ == "__main__":

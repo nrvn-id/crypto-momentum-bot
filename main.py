@@ -58,7 +58,7 @@ CONFIRM_RSI_MIN = 45        # di bawah ini dianggap belum ada bias bullish
 
 FIB_LOOKBACK = 60           # jumlah candle 4H untuk cari swing high/low
 
-MAX_RESULTS_IN_MESSAGE = 15
+MAX_RESULTS_IN_MESSAGE = 10
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -164,8 +164,8 @@ def entry_cross_signal(df: pd.DataFrame) -> dict:
 
     crossed_up = k.iloc[-2] <= d.iloc[-2] and k.iloc[-1] > d.iloc[-1]
     recently_oversold = (
-            k.iloc[-(CROSS_LOOKBACK + 1):-1].min() <= OVERSOLD
-            or d.iloc[-(CROSS_LOOKBACK + 1):-1].min() <= OVERSOLD
+        k.iloc[-(CROSS_LOOKBACK + 1):-1].min() <= OVERSOLD
+        or d.iloc[-(CROSS_LOOKBACK + 1):-1].min() <= OVERSOLD
     )
     return {
         "ok": bool(crossed_up and recently_oversold),
